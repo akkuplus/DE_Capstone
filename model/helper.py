@@ -14,7 +14,7 @@ fh.setLevel(level=logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
 logger.addHandler(fh)
-logger.debug("Initialized logger for Spark app")
+logger.debug("Initialized logger for App")
 
 
 def get_config():
@@ -38,22 +38,16 @@ def create_spark_session():
     os.environ['AWS_SECRET_ACCESS_KEY'] = config['AWS']['AWS_SECRET_ACCESS_KEY']
 
     # GET Spark Session
+    # https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/2.7.0/hadoop-aws-2.7.0.jar
+    # https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk/1.7.4/aws-java-sdk-1.7.4.jar
     spark = SparkSession \
         .builder \
         .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0") \
+        .config("spark.sql.debug.maxToStringFields", 1000) \
         .getOrCreate()
-    # https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/2.7.0/hadoop-aws-2.7.0.jar
-    # https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk/1.7.4/aws-java-sdk-1.7.4.jar
     logger.debug("Received Spark Instance")
 
     # PROVIDE S3 access settings to Spark
-    spark._jsc.hadoopConfiguration().set("fs.s3n.impl", "org.apache.hadoop.fs.s3native.NativeS3FileSystem")
-    spark._jsc.hadoopConfiguration() \
-        .set("fs.s3a.access.key", os.environ['AWS_ACCESS_KEY_ID'])
-    spark._jsc.hadoopConfiguration() \
-        .set("fs.s3a.secret.key", os.environ['AWS_SECRET_ACCESS_KEY'])
-    # spark._jsc.hadoopConfiguration()\
-    #     .set("fs.s3a.fast.upload", "true")
     logger.debug("Provided S3 access credentials")
 
     return spark
@@ -68,28 +62,29 @@ def get_schemas(name: str):
     """
 
     if name.upper() == 'RENTAL':
-        RENTAL_SCHEMA = T.StructType([T.StructField("regio1", T.StringType(), True),
-             T.StructField("serviceCharge", T.IntegerType(), True),
+        RENTAL_SCHEMA = T.StructType([
+             T.StructField("regio1", T.StringType(), True),
+             T.StructField("serviceCharge", T.DoubleType(), True),
              T.StructField("heatingType", T.StringType(), True),
              T.StructField("telekomTvOffer", T.StringType(), True),
-             T.StructField("telekomHybridUploadSpeed", T.IntegerType(), True),
+             T.StructField("telekomHybridUploadSpeed", T.StringType(), True),
              T.StructField("newlyConst", T.BooleanType(), True),
              T.StructField("balcony", T.BooleanType(), True),
              T.StructField("picturecount", T.IntegerType(), True),
-             T.StructField("pricetrend", T.DecimalType(), True),
-             T.StructField("telekomUploadSpeed", T.IntegerType(), True),
-             T.StructField("totalRent", T.IntegerType(), True),
-             T.StructField("yearConstructed", T.IntegerType(), True),
-             T.StructField("scoutId", T.LongType(), True),
-             T.StructField("noParkSpaces", T.IntegerType(), True),
+             T.StructField("pricetrend", T.DoubleType(), True),
+             T.StructField("telekomUploadSpeed", T.StringType(), True),
+             T.StructField("totalRent", T.DoubleType(), True),
+             T.StructField("yearConstructed", T.DoubleType(), True),
+             T.StructField("scoutId", T.IntegerType(), True),
+             T.StructField("noParkSpaces", T.StringType(), True),
              T.StructField("firingTypes", T.StringType(), True),
              T.StructField("hasKitchen", T.BooleanType(), True),
              T.StructField("geo_bln", T.StringType(), True),
              T.StructField("cellar", T.BooleanType(), True),
-             T.StructField("yearConstructedRange", T.IntegerType(), True),
-             T.StructField("baseRent", T.IntegerType(), True),
-             T.StructField("houseNumber", T.IntegerType(), True),
-             T.StructField("livingSpace", T.DecimalType(), True),
+             T.StructField("yearConstructedRange", T.DoubleType(), True),
+             T.StructField("baseRent", T.DoubleType(), True),
+             T.StructField("houseNumber", T.StringType(), True),
+             T.StructField("livingSpace", T.StringType(), True),
              T.StructField("geo_krs", T.StringType(), True),
              T.StructField("condition", T.StringType(), True),
              T.StructField("interiorQual", T.StringType(), True),
@@ -100,10 +95,10 @@ def get_schemas(name: str):
              T.StructField("baseRentRange", T.IntegerType(), True),
              T.StructField("typeOfFlat", T.StringType(), True),
              T.StructField("geo_plz", T.StringType(), True),
-             T.StructField("noRooms", T.IntegerType(), True),
-             T.StructField("thermalChar", T.DecimalType(), True),
-             T.StructField("floor", T.IntegerType(), True),
-             T.StructField("numberOfFloors", T.IntegerType(), True),
+             T.StructField("noRooms", T.StringType(), True),
+             T.StructField("thermalChar", T.StringType(), True),
+             T.StructField("floor", T.StringType(), True),
+             T.StructField("numberOfFloors", T.DoubleType(), True),
              T.StructField("noRoomsRange", T.IntegerType(), True),
              T.StructField("garden", T.BooleanType(), True),
              T.StructField("livingSpaceRange", T.IntegerType(), True),
@@ -111,13 +106,12 @@ def get_schemas(name: str):
              T.StructField("regio3", T.StringType(), True),
              # T.StructField("description", T.StringType(), True),  # Dropped this field
              # T.StructField("facilities", T.StringType(), True),  # Dropped this field
-             T.StructField("heatingCosts", T.DecimalType(), True),
+             T.StructField("heatingCosts", T.DoubleType(), True),
              T.StructField("energyEfficiencyClass", T.StringType(), True),
-             T.StructField("lastRefurbish", T.IntegerType(), True),
-             T.StructField("electricityBasePrice", T.DecimalType(), True),
+             T.StructField("lastRefurbish", T.DoubleType(), True),
+             T.StructField("electricityBasePrice", T.DoubleType(), True),
              T.StructField("electricityKwhPrice", T.DoubleType(), True),
              T.StructField("date", T.StringType(), True),
-             #T.StructField("misc", T.StringType(), True)
         ])
 
         return RENTAL_SCHEMA
@@ -144,12 +138,15 @@ def get_schemas(name: str):
             T.StructField("TariffName", T.StringType(), True),
         ])
 
-    return STATION_SCHEMA
+        return STATION_SCHEMA
+
+    raise ValueError(f"Found no schema with name {name}.")
+    return
 
 
 def extract_to_table(base_table, columns, table_name, output_path):
     """
-    Extract a given set of columns of a base table to parquet.
+    Extract from a base table a given set of columns to parquet.
 
     :para   base_table: Spark Dataframe holding data.
     :para   columns: Columns to extraxt from Dataframe
@@ -158,21 +155,27 @@ def extract_to_table(base_table, columns, table_name, output_path):
 
     """
 
-    # EXTRACT columns to create table
-    assert set(columns) == set(base_table.columns), f"Columns are not identical for table {table_name}"
+    try:
 
-    table = base_table\
-        .select()\
-        .drop_duplicates()\
-        .dropna(subset='scoutId')
+        # EXTRACT columns to create table
+        assert set(columns) == set(base_table.columns), f"Columns are not identical for table {table_name}"
 
-    # SHOW examples
-    print(f"\nShowing sample of {table_name}:")
-    table.show(10, truncate=False)
+        table = base_table\
+            .select(columns)\
+            .drop_duplicates()\
+            .dropna(subset='scoutId')
 
-    # PERSIST to parquet
-    output_location = os.path.join(output_path, f"{table_name}.parquet")
-    table.write.mode('overwrite').parquet(output_location)
-    logger.debug(f"Exported {table_name} as parquet")
+        # SHOW examples
+        print(f"\nShowing sample of {table_name}:")
+        table.show(10, truncate=False)
 
+        # PERSIST to parquet
+        output_location = os.path.join(output_path, f"{table_name}.parquet")
+        table.write.mode('overwrite').parquet(output_location)
+        logger.debug(f"Exported {table_name} as parquet")
+
+    except Exception as ex:
+        logger.error(f"Error writing {table_name} tp parquet. Reason: {ex}")
+
+    pass
     return
