@@ -1,14 +1,39 @@
-# Cloud Data Engineering With - Apache Spark
+# Cloud Data Engineering with Apache Spark
 
 ## Summary
 
-Since typical apartment rental offers just present apartment related information, the location in connection with good travel connections is a values but often not considered factor.    
-This project integrates apartment rental data and surrounding (public) transport hubs data and conducts ETL operations on files from a data lake and processes data with Apache Spark.    
+Since most platform showing apartment rentals offers just apartment related information, the location in connection 
+with (good) travel connections are a values factors. This project integrates apartment rental data and 
+surrounding (public) transport hubs data and conducts ETL operations and processes data with Apache Spark. the 
+project connects historical apartment rental data with data of nearby stations of public transportation.
 
-The first version of the project connects historical apartment rental data with data of nearby stations of public transportation.
-Using Apache Spark, the first step is to load data to AWS S3 data lake. The second step processes the data resources and writes back tables of extracted data to S3. Results are five tables that model a star schema.
+"""The first version of the project connects historical apartment rental data with data of nearby stations of public transportation.
+__Using Apache Spark, the first step is to load data to AWS S3 data lake. The second step processes the data resources and writes back tables of extracted data to S3. Results are five tables that model a star schema.__
+"""
+"
 
-Later versions of the project will integrate data regarding stations of German Railway, data of main nearby highway and motorway notes and APIs of major apartment rental platforms.
+Later versions of the project will integrate stations of German Railway, data of main nearby highway and motorway notes and APIs of major apartment rental platforms.
+
+
+## Provide data to Data Lake
+
+- Install AWS CLI version 2 (see https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)  
+
+
+- Configure access key and secrete key: 
+  - Step1: Open command prompt
+  - Step2: Type 
+     
+    `aws configure`  
+
+  - Step1: Enter access credentials
+
+
+- Copying data from local  to S3 bucket:
+  - Step1: Open command prompt
+  - Step2: Copy from local directory to S3 bucket
+   
+     `aws s3 cp ./data_collection/ s3://<your S3 bucket>`
 
 
 ## Data
@@ -95,7 +120,7 @@ The data sets consists of datasets of files, that are imported in AWS S3 data la
     PLZ: 24937, 
 
 
-## Data Models
+## Model data
 
 The data from sources is extracted and transformed to
 
@@ -103,7 +128,8 @@ The data from sources is extracted and transformed to
 
 The project requires a *Python 3.7* environment, Pyspark 2.4.3., and JAVA8-JDK (or higher). 
 
-To load data from AWS S3, AWS CLI is required, or use the zip files provided in GitHub project. 
+To load data from AWS S3, AWS CLI is required, using the files provided at `./data_collection/*` in GitHub project. 
+
 
 To access AWS S3 and to process data with AWS EMR, the config-file dl.cfg in sections [AWS] contains the access information. Use dl_example.cfg as template.
 The mandatory arguments are:
