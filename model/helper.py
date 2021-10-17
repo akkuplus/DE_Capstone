@@ -9,20 +9,29 @@ import pyspark.sql.types as T
 logger = logging.getLogger(__name__)
 logger.setLevel(level=logging.DEBUG)
 
-fh = logging.FileHandler('../event.log')
+data_location = os.getcwd()
+os.path.split(data_location)
+data_location = 'event.log'
+fh = logging.FileHandler(data_location)
 fh.setLevel(level=logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
 logger.addHandler(fh)
-logger.debug("Initialized logger for App")
+logger.debug("\nInitialized logger for App")
 
 
-def get_config():
+def get_config_reader():
     # GET Access settings
     config = configparser.ConfigParser()
     config.read('dl.cfg')
 
     return config
+
+
+def get_config_or_default(section, option, default=None):
+    config = get_config_reader()
+
+    return config.get(section, option) if config.has_section(section) and config.has_option(section, option) else default
 
 
 def create_spark_session():
@@ -32,19 +41,23 @@ def create_spark_session():
     :return: SparkSession
     """
 
-    config = get_config()
-
-    os.environ['AWS_ACCESS_KEY_ID'] = config['AWS']['AWS_ACCESS_KEY_ID']
-    os.environ['AWS_SECRET_ACCESS_KEY'] = config['AWS']['AWS_SECRET_ACCESS_KEY']
+    # GET configuration
+    config = get_config_reader()
+    os.environ['AWS_ACCESS_KEY_ID'] = config.get_config_or_default('AWS','AWS_ACCESS_KEY_ID')
+    os.environ['AWS_SECRET_ACCESS_KEY'] = config.get_config_or_default('AWS','AWS_SECRET_ACCESS_KEY')
+    assert os.environ['AWS_ACCESS_KEY_ID'] and os.environ['AWS_SECRET_ACCESS_KEY'], f"Error providing AWS access " \
+                                                                                    f"keys as environment variable"
 
     # GET Spark Session
     # https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/2.7.0/hadoop-aws-2.7.0.jar
     # https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk/1.7.4/aws-java-sdk-1.7.4.jar
     spark = SparkSession \
         .builder \
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0") \
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0,com.crealytics:spark-excel_2.11:0.12.2") \
         .config("spark.sql.debug.maxToStringFields", 1000) \
         .getOrCreate()
+    spark.sparkContext.setLogLevel("ERROR")
+
     logger.debug("Received Spark Instance")
 
     # PROVIDE S3 access settings to Spark
@@ -60,6 +73,15 @@ def get_schemas(name: str):
     :param name: name if requested schema: SONG or LOG
     :return: requested schema.
     """
+
+    if name.upper() == 'MAPPING':
+        MAPPING_Municipal_Zip_SCHEMA = T.StructType([
+            T.StructField("AGS", T.StringType(), True),
+            T.StructField("Bezeichnung", T.StringType(), True),
+            T.StructField("PLZ", T.StringType(), True)
+        ])
+
+        return MAPPING_Municipal_Zip_SCHEMA
 
     if name.upper() == 'RENTAL':
         RENTAL_SCHEMA = T.StructType([
@@ -144,7 +166,7 @@ def get_schemas(name: str):
     return
 
 
-def extract_to_table(base_table, columns, table_name, output_path):
+def extract_to_table(base_table, columns, table_name, output_path, show_Example=True):
     """
     Extract from a base table a given set of columns to parquet.
 
@@ -158,16 +180,16 @@ def extract_to_table(base_table, columns, table_name, output_path):
     try:
 
         # EXTRACT columns to create table
-        assert set(columns) == set(base_table.columns), f"Columns are not identical for table {table_name}"
+        assert set(columns).issubset(set(base_table.columns)), f"Not all columns in table {table_name}. "
 
         table = base_table\
             .select(columns)\
-            .drop_duplicates()\
-            .dropna(subset='scoutId')
+            .drop_duplicates()
 
         # SHOW examples
-        print(f"\nShowing sample of {table_name}:")
-        table.show(10, truncate=False)
+        if show_Example:
+            print(f"\nShowing sample of {table_name}:")
+            table.show(10, truncate=False)
 
         # PERSIST to parquet
         output_location = os.path.join(output_path, f"{table_name}.parquet")
@@ -175,7 +197,7 @@ def extract_to_table(base_table, columns, table_name, output_path):
         logger.debug(f"Exported {table_name} as parquet")
 
     except Exception as ex:
-        logger.error(f"Error writing {table_name} tp parquet. Reason: {ex}")
+        logger.error(f"Error writing {table_name} to parquet. Reason:\n{ex}")
 
-    pass
+
     return
