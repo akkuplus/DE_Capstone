@@ -20,8 +20,8 @@ logger.addHandler(fh)
 logger.debug("\nInitialized logger for App")
 
 
-def get_config_reader():
-    # GET Access settings
+def _get_config_reader():
+    # GET access settings
     config = configparser.ConfigParser()
     config.read('dl.cfg')
 
@@ -29,7 +29,7 @@ def get_config_reader():
 
 
 def get_config_or_default(section, option, default=None):
-    config = get_config_reader()
+    config = _get_config_reader()
 
     return config.get(section, option) if config.has_section(section) and config.has_option(section, option) else default
 
@@ -41,29 +41,79 @@ def create_spark_session():
     :return: SparkSession
     """
 
-    # GET configuration
-    config = get_config_reader()
-    os.environ['AWS_ACCESS_KEY_ID'] = config.get_config_or_default('AWS','AWS_ACCESS_KEY_ID')
-    os.environ['AWS_SECRET_ACCESS_KEY'] = config.get_config_or_default('AWS','AWS_SECRET_ACCESS_KEY')
-    assert os.environ['AWS_ACCESS_KEY_ID'] and os.environ['AWS_SECRET_ACCESS_KEY'], f"Error providing AWS access " \
-                                                                                    f"keys as environment variable"
 
     # GET Spark Session
     # https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/2.7.0/hadoop-aws-2.7.0.jar
     # https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk/1.7.4/aws-java-sdk-1.7.4.jar
+    SPARK_JARS = get_config_or_default('AWS', 'SPARK_JARS')
+
+    assert SPARK_JARS, f"Error reading Jar-files for Spark {SPARK_JARS}"
+
     spark = SparkSession \
         .builder \
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0,com.crealytics:spark-excel_2.11:0.12.2") \
+        .config("spark.jars.packages", SPARK_JARS) \
         .config("spark.sql.debug.maxToStringFields", 1000) \
         .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
+    logger.debug("Initialized Spark instance")
 
-    logger.debug("Received Spark Instance")
-
-    # PROVIDE S3 access settings to Spark
-    logger.debug("Provided S3 access credentials")
+    assert test_s3_access(spark), "Error writing parquet testfile to S3a"
 
     return spark
+
+
+def test_s3_access(spark):
+    """
+    Test provide configuration data and test write acces to S3a using a Spark session.
+
+    :param spark: SparkSession
+    """
+
+    # GET S3 access settings
+    ACCESS_ID = get_config_or_default('AWS', 'ACCESS_ID')
+    ACCESS_SECRET = get_config_or_default('AWS', 'ACCESS_SECRET')
+    S3A_ENDPOINT = get_config_or_default('AWS', 'S3A_ENDPOINT')
+    BUCKET_NAME = get_config_or_default('AWS', 'BUCKET_NAME')
+    DIRECTORY = get_config_or_default('AWS', 'DIRECTORY')
+    TEST_FILE = get_config_or_default('AWS', 'TEST_FILE')
+
+    assert type(ACCESS_ID) == str \
+        and type(ACCESS_SECRET) == str \
+        and type(S3A_ENDPOINT) == str \
+        and type(BUCKET_NAME) == str \
+        and type(DIRECTORY) == str \
+        and type(TEST_FILE) == str, \
+        f"Error providing AWS S3a access keys as environment variable"
+
+    # SET Spark configuration to access S3a
+    # See https://stackoverflow.com/questions/55119337/read-files-from-s3-pyspark
+    spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", ACCESS_ID)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", ACCESS_SECRET)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", S3A_ENDPOINT)
+    spark._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    spark._jsc.hadoopConfiguration().set("com.amazonaws.services.s3.enableV4", "true")
+    spark._jsc.hadoopConfiguration().set("fs.s3a.aws.credentials.provider",
+                                         "org.apache.hadoop.fs.s3a.BasicAWSCredentialsProvider")
+
+    # TEST read-write access
+    try:
+        data, columns = [(1, 1), (2, 2)], ["col1", "col2"]
+        data_location = f"{BUCKET_NAME}/{DIRECTORY}/{TEST_FILE}"
+        logger.debug(f"S3 location is {data_location}")
+
+        # Requirements for reading from / writing to S3:
+        # "HADOOP_HOME" as environment variable pointing to directory "Hadoop" Within, find <HADOOP_HOME>/bin: hadoop.dll
+        # and winutils.exe. "%HADOOP_HOME%\bin" is part of path-variable und hadoop.dll is in /windows/system32/
+        # See: https://sparkbyexamples.com/spark/spark-hadoop-exception-in-thread-main-java-lang-unsatisfiedlinkerror-org-apache-hadoop-io-nativeio-nativeiowindows-access0ljava-lang-stringiz/
+        # See: https://stackoverflow.com/questions/41851066/exception-in-thread-main-java-lang-unsatisfiedlinkerror-org-apache-hadoop-io
+        spark.createDataFrame(data=data, schema=columns).write.mode("overwrite").parquet(data_location)
+        spark.read.parquet(data_location).show()
+    except Exception as ex:
+        logger.error(f"Error writing parquet testfile to S3 address {data_location}. Reason {ex}")
+        raise
+    logger.debug("Sucessfully wrote testfile to S3")
+
+    return True
 
 
 def get_schemas(name: str):
