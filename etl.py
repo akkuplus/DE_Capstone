@@ -1,8 +1,8 @@
 import os
 
-import model.helper as helper
-import model.process_inbound as process_inbound
-import model.process_outbound as process_outbound
+import etl.helper as helper
+import etl.process_inbound as process_inbound
+import etl.process_outbound as process_outbound
 
 
 def main():
@@ -10,31 +10,41 @@ def main():
     Implement main ETL functionality.
     """
 
-    # GET Spark session
-    spark = helper.create_spark_session()
+    spark, input_path, output_path = helper.get_setup(do_test_s3_access=False)
 
-    # SET input and output path
-    #input_path = os.path.join(os.getcwd(), "data")
-    input_path = helper.get_config_or_default("DataLake", "DATA_LAKE_INPUT_PATH")
-    helper.logger.debug(f"Set input_data_path to {input_path}")
+    # GET working mode
+    work_mode = helper.get_config_or_default("General", "work_mode").split(",")
 
-    #output_path = os.path.join(os.getcwd(), "data")
-    output_path = helper.get_config_or_default("DataLake", "DATA_LAKE_OUTPUT_PATH")
-    helper.logger.debug(f"Set output_data_path to {output_path}")
-
-    if True:
+    if "process_immoscout_data" in work_mode:
         # GET Rental data
         process_inbound.process_immoscout_data(spark, input_path, output_path)
 
+    if "process_station_data" in work_mode:
         # GET Station data
         process_inbound.process_station_data(spark, input_path, output_path)
 
+    if "process_mappings" in work_mode:
         # GET mappings municipal code, zip code, coordinates
         process_inbound.process_mappings(spark, input_path, output_path)
 
-    process_outbound.main()
+    if "process_outbound" in work_mode:
+
+        # ADD zip code to Station data
+        table_stations_with_zip = process_outbound.step1(spark, input_path)
+
+        # GET Key Table holding joined data of Rental and Station
+        KT_rental_with_station = process_outbound.step2(spark, input_path, output_path,
+                                                        table_stations_with_zip=table_stations_with_zip)
+
+        # GET data of Rental location with matched Station
+        process_outbound.step_last(spark, input_path, output_path,
+                               KT_rental_with_station=KT_rental_with_station)
+
+        helper.logger.debug("Created data mart")
+
     helper.logger.debug("Finished ETL\n")
 
 
 if __name__ == "__main__":
+    pass
     main()
