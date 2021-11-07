@@ -1,22 +1,15 @@
 import os
+from math import sin
+
 import pandas as pd
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
 from pyspark.sql.types import StructType, StructField, StringType
 
-import model.helper as helper
+import etl.helper as helper
 
 
-def main():
-    spark = helper.create_spark_session()
-    helper.logger.debug("Created Spark session")
-
-    # SET input and output path
-    input_path = os.path.join(os.getcwd(), "data")
-    helper.logger.debug(f"Set input_data to {input_path}")
-    output_path = os.path.join(os.getcwd(), "data")
-    helper.logger.debug(f"Set output_data to {output_path}")
-
+def main(spark, input_path, output_path):
 
     # Strategy:
     # apartment location  -> identify stations within a certain surrounding
@@ -108,7 +101,7 @@ def main():
     # Q2) combine which tables and how?
     # APPROACH 1)
     # ==> combine table_rental_location and table_majorstations_in_municipals:
-    # match via table_majorstations_in_municipals(MunicipalityCode) -> zipcode -> table_rental_location(geo_plz)
+    # match table_majorstations_in_municipals(MunicipalityCode) -> via zipcode -> with table_rental_location(geo_plz)
 
     # STATIONS data
     name = "table_majorstations_in_municipals"
@@ -132,12 +125,12 @@ def main():
     del table_mapping_municipal_ZIP
 
     colums =["PLZ"]
-    print("Missing values of zip code in stations")
+    print("Missing values of zipcode")
     print(f"Total of rows:{table_stations_with_zip.select(colums).count()}")
     print(f"Total rows missing a zipcode:{table_stations_with_zip.select([F.count(F.when(F.isnan(c) | F.col(c).isNull(), c)).alias(c) for c in colums]).collect()}")
     # -> we have 971 missing PLZ -> continue with most stations
 
-    # JOIN Rentals with Stations on zip code
+    # JOIN Rental and Station on zipcode
     location = os.path.join(input_path, "table_rental_location.parquet")
     table_rental_location = spark.read.parquet(location)
 
@@ -148,8 +141,6 @@ def main():
     table_KT_rentals_with_stations = table_KT_rentals_with_stations.withColumnRenamed("Parent","Parent_Id")
     table_KT_rentals_with_stations.show(5)
     print(f"\n\ntable_KT_rentals_with_stations\n{table_KT_rentals_with_stations.take(5)}")
-
-
     del table_mapping_municipal_to_zip, table_rental_location, table_stations_with_zip
 
 
@@ -207,3 +198,114 @@ def main():
 
     helper.logger.debug("Created data mart")
 
+
+def step1(spark, input_path):
+    """
+    Add zipcode to station data, since station data only columns 'Latitude', 'Longitude', 'MunicipalityCode'.
+
+    :param spark:                       Apache Spark session.
+    :param input_path:                  Path for Input data.
+    :return table_stations_with_zip:    Station data having matched zip code.
+    """
+
+    # LOAD preprocessed STATION data
+    name = "table_majorstations_in_municipals"
+    table_stations_in_municipals = helper.create_df_from_parquet(spark, name, input_path)
+
+    # LOAD preprocessed MAPPING data (municipality to zip code)
+    name = "table_mapping_municipal_to_zip"
+    table_mapping_municipal_ZIP = helper.create_df_from_parquet(spark, name, input_path)
+
+    # JOIN data of Station and Mapping on municipality code
+    cond = [table_stations_in_municipals.MunicipalityCode == table_mapping_municipal_ZIP.AGS]
+    table_stations_with_zip = table_stations_in_municipals.join(table_mapping_municipal_ZIP, cond, "left")
+
+    # See: analyze.show_missing_munitipality_code(table_stations_with_zip)
+
+    return table_stations_with_zip
+
+
+def step2(spark, input_path, output_path, table_stations_with_zip):
+    """
+    Get Key Table holding joined data of Rental and Station based in some zip code.
+
+    :param spark:                       Apache Spark session.
+    :param input_path:                  Path for Input data.
+    :param output_path:                 Path for Output data.
+    :param table_stations_with_zip:     Rental data having a Station as result of step1.
+    :return KT_rental_with_station:     Key Table of Rental matched with Station data represents the IDs of both tables.
+    """
+
+    # GET Key Tables that just hold relevant keys (KT = Key Table)
+    required_columns = ["PLZ", "Parent"]
+    assert set(required_columns).issubset(table_stations_with_zip.columns), f"Missing columns {required_columns} not in table"
+    KT_stations_with_zip = table_stations_with_zip.select(required_columns).withColumnRenamed("Parent", "Parent_Id")
+
+    name = "table_rental_location"
+    required_columns = ["scoutId", "geo_plz"]
+    table_rental_location = helper.create_df_from_parquet(spark, name, input_path)
+    KT_rental_location = table_rental_location.select(required_columns)
+
+    # JOIN Rental and Station tables on 'PLZ' (== zip code)
+    cond = [KT_rental_location.geo_plz == KT_stations_with_zip.PLZ]
+    KT_rental_with_station = KT_rental_location\
+        .join(KT_stations_with_zip, cond, "left")
+
+    # EXTRACT Rental WITHOUT a matching Station / zip code. Just save the 'scoutID'
+    table_rental_missing_station_and_zip = KT_rental_with_station \
+        .where(KT_rental_with_station.PLZ.isNull())\
+        .select("scoutId")
+    table_name = "table_rental_missing_station_and_zip"
+    columns = table_rental_missing_station_and_zip.columns
+    helper.extract_to_table(base_table=table_rental_missing_station_and_zip, columns=columns,
+                            table_name=table_name, output_path=output_path, show_example=False,
+                            single_partition=True)
+
+    # EXTRACT Rental with Station WITH a matching Station / zip code. Save the keys of this matching.
+    KT_rental_with_station = KT_rental_with_station\
+        .where(KT_rental_with_station.PLZ.isNotNull())\
+        .select(["scoutId", "geo_plz", "PLZ", "Parent_Id"])
+    table_name = "KT_rental_with_station"
+    columns = KT_rental_with_station.columns
+    helper.extract_to_table(base_table=KT_rental_with_station, columns=columns,
+                            table_name=table_name, output_path=output_path, show_example=False,
+                            single_partition=True)
+
+    return KT_rental_with_station
+
+
+def step3(spark, input_path, output_path, KT_rental_with_station):
+    """
+    Combine data of Rental location with matched Station.
+    Resulting table schema:
+    ['scoutId', 'date', 'regio1', 'regio2', 'regio3', 'street', 'streetPlain', 'houseNumber', 'PLZ', 'Parent_Id']
+
+    :param spark:                       Apache Spark session.
+    :param input_path:                  Path for Input data.
+    :param output_path:                 Path for Output data.
+    :param table_stations_with_zip:     Rental data having a Station as result of step1.
+    :return KT_rental_with_station:     Key Table of Rental matched with Station data represents the IDs of both tables.
+    """
+
+    # required: KT_rental_with_station, table_stations_in_municipals
+    required_columns = ["PLZ", "Parent_Id", "scoutId"]
+    assert set(required_columns).issubset(KT_rental_with_station.columns), f"Missing columns {required_columns} not in table"
+    KT_rental_with_station = KT_rental_with_station.withColumnRenamed("scoutId", "scoutId_2")
+
+    name = "table_rental_location"
+    table_rental_location = helper.create_df_from_parquet(spark, name, input_path)
+
+    cond = [table_rental_location.scoutId == KT_rental_with_station.scoutId_2]
+    table_rental_location_with_station = table_rental_location \
+        .join(KT_rental_with_station, cond, "right") \
+        .drop(*["geo_bln","geo_krs","geo_plz","scoutId_2"])
+        #.select(["scoutId", "DHID", "Parent", "Name", "Latitude", "Longitude"])
+    table_rental_location_with_station.show(5)
+
+    # PERSIST to parquet
+    table_name = "table_rental_location_with_station"
+    columns = table_rental_location_with_station.columns
+    helper.extract_to_table(base_table=table_rental_location_with_station, columns=columns,
+                            table_name=table_name, output_path=output_path, show_example=False)
+
+    return
