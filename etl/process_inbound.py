@@ -1,6 +1,9 @@
 import os
 import pandas as pd
 import pyspark.sql.functions as F
+import pyspark.sql.types as T
+import requests
+import time
 
 from etl import helper
 
@@ -165,16 +168,11 @@ def process_station_data(spark, input_path, output_path):
     helper.logger.debug("Cast columns 'Latitude' and 'Longtitude' to float")
     helper.logger.info("Imported Station data")
 
-    # FIND all (major) stations that have a municipality code
-    table_stations_Gemeinden = df_stations.where(df_stations["MunicipalityCode"] != "00000000")
-    helper.logger.debug("Filtered Station data to MunicipalityCode unequal 00000000")
-
     # EXTRACT table to parquet
     columns = ["SeqNo", "Type", "DHID", "Parent", "Name", "Latitude", "Longitude", "MunicipalityCode", "Municipality"]
-    helper.extract_to_table(base_table=table_stations_Gemeinden, columns=columns,
-                            table_name="table_majorstations_in_municipals", output_path=output_path,
+    helper.extract_to_table(base_table=df_stations, columns=columns,
+                            table_name="table_stations", output_path=output_path,
                             single_partition=True)
-    df_stations.unpersist()
     del df_stations
 
     return df_stations_raw

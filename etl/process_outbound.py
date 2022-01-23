@@ -1,311 +1,577 @@
+import folium
+import numpy as np
 import os
-from math import sin
-
 import pandas as pd
+from pyspark import StorageLevel
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
 from pyspark.sql.types import StructType, StructField, StringType
+from scipy import spatial
+import requests
+import time
+import webbrowser
 
 import etl.helper as helper
 
 
-def main(spark, input_path, output_path):
-
-    # Strategy:
-    # apartment location  -> identify stations within a certain surrounding
-    # -> find like 10 nearest stations
-
-    # Q1) Which tables contain what data?
-    location = os.path.join(input_path, "table_rental_location.parquet")
-    table_rental_location = spark.read.parquet(location)
-    print(f"\n\ntable_rental_location\n{table_rental_location.show(2, truncate=True)}")
+def query_coordinates(spark, input_path, output_path, url="http://localhost:2322/api"):
     """
-    +---------+-----+-------------------+--------------------+------------------+-------------------+--------------------+-------+--------------------+--------------------+-----------+
-    |  scoutId| date|             regio1|              regio2|            regio3|            geo_bln|             geo_krs|geo_plz|              street|         streetPlain|houseNumber|
-    +---------+-----+-------------------+--------------------+------------------+-------------------+--------------------+-------+--------------------+--------------------+-----------+
-    |111372798|May19|            Sachsen|             Leipzig|          Plagwitz|            Sachsen|             Leipzig|  04229|Karl - Heine - St...|Karl_-_Heine_-_St...|          9|
-    |114400812|Feb20|            Sachsen| Mittelsachsen_Kreis|            Döbeln|            Sachsen| Mittelsachsen_Kreis|  04720|    Burgstra&szlig;e|          Burgstraße|         11|
-    """
-    # how many nulls in columns, like zip code and streetPlain?
-    # See https://sparkbyexamples.com/pyspark/pyspark-find-count-of-null-none-nan-values/
-    #table_rental_location = table_rental_location.drop(F.col("is_na"))
-    df_temp = table_rental_location.select(
-        [F.count(
-            F.when(F.col(c).contains('None') | F.col(c).contains('NULL')
-                   | (F.col(c) == '' )  | F.col(c).isNull() | F.isnan(c), c
-                   )
-        ).alias(c) for c in table_rental_location.columns
-        ])
-    print(f"\nTotal of missing values\n{df_temp.show()}")
-    del df_temp
+    Query coordinates of rental offers using address information and Photon geocoding service and save as parquet.
 
-    colums =["geo_plz"]
-    expr = table_rental_location.select([F.count(F.when(F.isnan(c) | F.col(c).isNull(), c)).alias(c) for c in colums])
-    print(f"\nTotal of missing zip codes\n{expr.show()}")
-
-    """
-    addresses = table_rental_location.select(["geo_bln","geo_krs","geo_plz","streetPlain"]).drop_duplicates()
-    >>> addresses.count()
-        97250
-    >>> addresses.groupby(["geo_bln"]).count().orderBy(["count"]).show()
-        |             geo_bln|count|
-        +--------------------+-----+
-        |            Saarland|  505|
-        |              Bremen| 1021|
-        |             Hamburg| 1517|
-        |Mecklenburg_Vorpo...| 2416|
-        |           Thüringen| 2853|
-        |         Brandenburg| 2935|
-        |  Schleswig_Holstein| 3060|
-        |     Rheinland_Pfalz| 3675|
-        |              Berlin| 3905|
-        |      Sachsen_Anhalt| 5312|
-        |              Hessen| 6554|
-        |   Baden_Württemberg| 7003|
-        |       Niedersachsen| 7404|
-        |              Bayern| 9632|
-        |             Sachsen|12224|
-        | Nordrhein_Westfalen|27234|
-        +--------------------+-----+
-    >>> table_rental_location.select(["geo_bln","geo_krs","streetPlain"]).drop_duplicates().count()    
-        85991
+    :param spark:       Apache Spark session.
+    :param input_path:  Path for Input data.
+    :param output_path: Path for Output data.
+    :param url:         URL of photon service.
     """
 
+    # PREPARE table_rental_location
+    helper.logger.info(f"Preparing table rental location for geocoding...")
+    table_rental_location = prepare_table_rental_location(spark, input_path)
 
-    print("\n\ntable_majorstations_in_municipals.parquet")
-    location = os.path.join(input_path, "table_majorstations_in_municipals.parquet")
-    table_majorstations_in_municipals = spark.read.parquet(location)
-    table_majorstations_in_municipals.show(5)
+    assert helper.check_photon_service(url), f"No response from Photon on {url}"
+
+    # GET and SAVE coordinates
+    _query_coordinates(spark, url, table_rental_location, output_path)
+
+    return
+
+
+def prepare_table_rental_location(spark, input_path):
     """
-    +-----+----+--------------+--------------+--------------------+---------+---------+----------------+--------------------+
-    |SeqNo|Type|          DHID|        Parent|                Name| Latitude|Longitude|MunicipalityCode|        Municipality|
-    +-----+----+--------------+--------------+--------------------+---------+---------+----------------+--------------------+
-    |  638|   S|de:07334:35017|de:07334:35017|Germersheim Schla...|49.222374| 8.376188|        07334007|         Germersheim|
-    | 1896|   S| de:08111:2478| de:08111:2478|Stuttgart Zuffenh...|48.823223| 9.185597|        08111000|           Stuttgart|
+    Process the files containing data for mappings (municipality code to zip code, and zip code to coordinates)
+    in the given path, derive tables and write these tables as parquet.
+
+    :param spark:       Apache Spark session.
+    :param input_path:  Path for Output data.
+    """
+    # LOAD rental data
+    table_name = "table_rental_location"
+    table_rental_location = helper.create_df_from_parquet(spark, table_name, input_path)
+
+    # PREPARE data for geocoding
+    for column in table_rental_location.columns:
+        table_rental_location = table_rental_location\
+            .withColumn(column, F.when(F.isnan(F.col(column)), None).otherwise(F.col(column)))
+    table_rental_location.show()
+
+    column = "streetPlain"
+    table_rental_location = table_rental_location \
+        .select(["scoutId", "streetPlain", "houseNumber", "geo_plz", "geo_krs", "geo_bln"]) \
+        .where(~F.col(column).contains('None')
+               & ~F.col(column).contains('NULL')
+               & ~F.col(column).contains('no_information')
+               & ~(F.col(column) == '')
+               & ~F.col(column).isNull()
+               & ~F.isnan(column)) \
+        .withColumn("_id", F.monotonically_increasing_id()) \
+        .withColumn('streetPlain', F.regexp_replace('streetPlain', '_', ' ')) \
+        .withColumn('houseNumber', F.regexp_replace('houseNumber', '-', ' ')) \
+        .withColumn('houseNumber', F.regexp_replace('houseNumber', '[^0-9]', ' ')) \
+        .withColumn('geo_krs', F.regexp_replace('geo_krs', '_Kreis', '')) \
+        .withColumn('geo_krs', F.regexp_replace('geo_krs', '_', ' ')) \
+        .withColumn('geo_bln', F.regexp_replace('geo_bln', '_', ' ')) \
+        .withColumn('address_string', F.concat(F.col('streetPlain'), F.lit(' '),
+                                               F.col('houseNumber'), F.lit(', '),
+                                               F.col('geo_plz'), F.lit(', '),
+                                               F.col('geo_krs'), F.lit(', '),
+                                               F.col('geo_bln'))) \
+        .cache()
+
+    return table_rental_location
+
+
+def _query_coordinates(spark, url, table_rental_location, output_path, idx=None):
+    """
+    Process the files containing data for mappings (municipality code to zip code, and zip code to coordinates)
+    in the given path, derive tables and write these tables as parquet.
+
+    :param spark:                   Apache Spark session.
+    :param url:                     URL of Photon geocoding service.
+    :param table_rental_location    Tables with rental offers and addresses.
+    :param output_path:             Path for Output data.
     """
 
+    # SETUP for geocoding
+    schema = T.StructType([
+        T.StructField("Lat", T.DoubleType(), False),
+        T.StructField("Lng", T.DoubleType(), False)])
+    UDF_geocode = F.udf(helper.geocode_coordinates, schema)
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
 
-    print("\n\ntable_mapping_municipal_to_zip")
-    location = os.path.join(input_path, "table_mapping_municipal_to_zip.parquet")
-    table_mapping_municipal_to_zip = spark.read.parquet(location)
-    table_mapping_municipal_to_zip.show(5)
+    # SPLIT, maybe parallelize -> query separate photon instances
+    if not idx:
+        idx = table_rental_location.approxQuantile("_id", [0.5], 0.00001)[0]
+
+    start_time = time.time()
+    df_temp = table_rental_location.where(F.col("_id") <= idx)
+    df = df_temp.withColumn('extractedCoords',
+                            UDF_geocode(F.col("address_string"), F.lit(url)))  # duration: around one hour for one half
+
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
+    df = df.withColumn("lat", F.col("extractedCoords.Lat")) \
+        .withColumn("lng", F.col("extractedCoords.Lng")) \
+        .drop(F.col("extractedCoords"))
+    helper.extract_to_table(base_table=df, output_path=output_path, single_partition=True,
+                            table_name="table_rental_location_partA", columns=df.columns)
+    end_time = time.time()
+    helper.logger.info(f"Duration Querying PartA: {end_time - start_time}")
+
+    start_time = time.time()
+    df_temp = table_rental_location.where(F.col("_id") > idx)
+    df = df_temp.withColumn('extractedCoords',
+                            UDF_geocode(F.col("address_string"), F.lit(url)))  # last around one hour for second half
+
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
+    df = df.withColumn("lat", F.col("extractedCoords.Lat")) \
+        .withColumn("lng", F.col("extractedCoords.Lng")) \
+        .drop(F.col("extractedCoords"))
+    helper.extract_to_table(base_table=df, output_path=output_path, single_partition=True,
+                            table_name="table_rental_location_partB", columns=df.columns)
+    end_time = time.time()
+    helper.logger.info(f"Duration Querying PartB: {end_time - start_time}")
+
+    return
+
+
+def load_table_rental_locations_with_coordindates(spark, input_path):
     """
-    +--------+---------------+-----+
-    |     AGS|    Bezeichnung|  PLZ|
-    +--------+---------------+-----+
-    |01053024|    Düchelsdorf|23847|
-    |01054079|     Löwenstedt|25864|
+    Load and return table rental location with previously queried coordinates.
+
+    :param spark:       Apache Spark session.
+    :param input_path:  Path for Output data.
+    :return table:      Spark dataframe of rental offers with coordinates.
+    """
+    # COMBINE combine parts of table_rental_location with coords
+    table_name = "table_rental_location_partA.parquet"
+    # input_local_path = "C:\Python\_Working\DatEng_Capstone"
+    table_rental_location_a = helper.create_df_from_parquet(spark, table_name, input_path)
+
+    table_name = "table_rental_location_partB.parquet"
+    # input_local_path = "C:\Python\_Working\DatEng_Capstone"
+    table_rental_location_b = helper.create_df_from_parquet(spark, table_name, input_path)
+
+    table_rental_location_coords = table_rental_location_a.union(table_rental_location_b) \
+        .withColumn("zip_group", F.col('geo_plz').substr(1, 3)) \
+        .cache()
+    del table_rental_location_a, table_rental_location_b
+
+    return table_rental_location_coords
+
+
+def _join_parent_and_child(table_stations_with_zip):
+    """
+    Join child rows on parent rows in table stations with zip.
+
+    In the table, a lot of rows point to a parent. Parents holds information, so join children on these dependent rows.
+    Parents have identical values in the columns DHID and Parent, and children have different values in both columns.
     """
 
+    # split table_stations_with_zip into parents and childs. Parents have information regarding Municipality and ZIP,
+    # childs have not.
 
-    # Q2) combine which tables and how?
-    # APPROACH 1)
-    # ==> combine table_rental_location and table_majorstations_in_municipals:
-    # match table_majorstations_in_municipals(MunicipalityCode) -> via zipcode -> with table_rental_location(geo_plz)
+    source_count = table_stations_with_zip.count()
 
-    # STATIONS data
-    name = "table_majorstations_in_municipals"
-    data_location = os.path.join(input_path, f"{name}.parquet")
-    assert os.path.exists(data_location)
-    table_stations_in_municipals = spark.read.parquet(data_location)
-    table_stations_in_municipals.show(5, truncate=True)
+    childs = table_stations_with_zip \
+        .where(table_stations_with_zip["MunicipalityCode"] == "00000000") \
+        .withColumnRenamed("Parent", "Parent_in_Child") \
+        .withColumnRenamed("DHID", "DHID_in_Child") \
+        .drop(*["Municipality", "MunicipalityCode", "MunicipalityCode_ZIP", "name_ZIP", "PLZ"])
+    childs_count = childs.count()
 
-    # Mapping data municipality AND zip
-    name = "table_mapping_municipal_to_zip"
-    data_location = os.path.join(input_path, f"{name}.parquet")
-    assert os.path.exists(data_location)
-    table_mapping_municipal_ZIP = spark.read.parquet(data_location)
-    print("\n\ntable_mapping_municipal_to_zip")
-    table_mapping_municipal_ZIP.show(5, truncate=True)
+    parents = table_stations_with_zip\
+        .where(table_stations_with_zip["MunicipalityCode"] != "00000000") \
+        .drop(*["SeqNo", "Type", "Name", "Latitude", "Longitude"]) \
+        .withColumnRenamed("DHID", "DHID_in_Parent") \
+        .withColumnRenamed("Parent", "Parent_in_Parent") \
+        .withColumn('ZIP_Group_Station', F.col('PLZ').substr(1, 3))
+    parents_count = parents.count()
 
-    # JOIN stations and zip on municipality
-    cond = [table_stations_in_municipals.MunicipalityCode == table_mapping_municipal_ZIP.AGS]
-    table_stations_with_zip = table_stations_in_municipals.join(table_mapping_municipal_ZIP, cond, "left")
-    table_stations_with_zip.show(5, truncate=True)
-    del table_mapping_municipal_ZIP
+    # JOIN parent on child to fill missing information
+    cond = [childs.Parent_in_Child == parents.DHID_in_Parent]  # <==> where Child.Parent == Parent.DHID
+    childs = childs.join(parents, cond, "left")
+    childs = childs \
+        .drop(*["DHID_in_Parent", "Parent_in_Parent"]) \
+        .withColumnRenamed("DHID_in_CHild", "DHID") \
+        .withColumnRenamed("Parent_in_Child", "Parent")
 
-    colums =["PLZ"]
-    print("Missing values of zipcode")
-    print(f"Total of rows:{table_stations_with_zip.select(colums).count()}")
-    print(f"Total rows missing a zipcode:{table_stations_with_zip.select([F.count(F.when(F.isnan(c) | F.col(c).isNull(), c)).alias(c) for c in colums]).collect()}")
-    # -> we have 971 missing PLZ -> continue with most stations
+    try:
+        table_stations_with_zip2 = table_stations_with_zip\
+            .where(table_stations_with_zip["MunicipalityCode"] != "00000000")\
+            .withColumn('ZIP_Group_Station', F.col('PLZ').substr(1, 3))\
+            .union(childs)
+        table_stations_with_zip2\
+            .withColumn('ZIP_Group_Station', F.col('PLZ').substr(1, 3))\
+            .cache()
+        joined_count = table_stations_with_zip2.count()
+        assert source_count == joined_count, f"Error transforming table_stations_with_zip. " \
+                                             f"Count of rows of source and result differ."
+    except Exception as ex:
+        helper.logger.error(f"Error while union of parent and children of table_stations_with_zip. Reason:{ex}")
+        raise
 
-    # JOIN Rental and Station on zipcode
-    location = os.path.join(input_path, "table_rental_location.parquet")
-    table_rental_location = spark.read.parquet(location)
-
-    table_KT_rental_location = table_rental_location.select(["scoutId","geo_plz"])
-    table_KT_stations_with_zip = table_stations_with_zip.select(["PLZ", "Parent"])
-    cond = [table_KT_rental_location.geo_plz == table_KT_stations_with_zip.PLZ]
-    table_KT_rentals_with_stations = table_KT_rental_location.join(table_KT_stations_with_zip, cond, "left")
-    table_KT_rentals_with_stations = table_KT_rentals_with_stations.withColumnRenamed("Parent","Parent_Id")
-    table_KT_rentals_with_stations.show(5)
-    print(f"\n\ntable_KT_rentals_with_stations\n{table_KT_rentals_with_stations.take(5)}")
-    del table_mapping_municipal_to_zip, table_rental_location, table_stations_with_zip
-
-
-    columns = "PLZ"
-    print(f"Total of rows: {table_KT_rentals_with_stations.select('PLZ').count()}")
-    print(f"Total of individual zip codes: {table_KT_rentals_with_stations.select('PLZ').distinct().count()}")
-    print(f"Total of missing zip codes: {table_KT_rentals_with_stations.select([F.count(F.when(F.isnan(c) | F.col(c).isNull(), c)).alias(c) for c in colums]).take(1)}")
-
-    table_KT_rentals_with_stations.show(5)
-    columns = table_KT_rentals_with_stations.columns
-    helper.extract_to_table(base_table=table_KT_rentals_with_stations, columns=columns,
-                            table_name="table_KT_rentals_with_stations", output_path=output_path)
-
-    columns = "PLZ"
-    table_KT_rentals_with_stations.select("geo_plz","PLZ", F.col(columns).isNull() ).show()  # OK
-    table_KT_rentals_with_stations.where(F.col(columns).isNull()).select("geo_plz","PLZ").distinct().count() # ok
-    table_KT_rentals_with_stations.where(F.col(columns).isNull()).select("scoutId","geo_plz","PLZ").show()
-    # -> no matching on PLZ for 2501 values of zipcode -> geocode
-
-    # Save incomplete rows
-    table_rental_missing_station_and_zip = table_KT_rentals_with_stations.where(F.col(columns).isNull()).select("scoutId")
-    table_name = "table_rental_missing_station_and_zip"
-    output_location = os.path.join(output_path, f"{table_name}.parquet")
-    table_rental_missing_station_and_zip.write.mode('overwrite').parquet(output_location)
-    del table_rental_missing_station_and_zip
-
-    # Save complete rows
-    table_KT_rentals_with_stations = table_KT_rentals_with_stations.where(F.col(columns).isNotNull())
-
-    table_name = "table_KT_rentals_with_stations"
-    output_location = os.path.join(output_path, f"{table_name}.parquet")
-    table_KT_rentals_with_stations.write.mode('overwrite').parquet(output_location)
-    helper.logger.debug(f"Exported {table_name} as parquet")
+    return table_stations_with_zip2
 
 
-    # Resulting table schema>
-    # scountId|DHID|Parent|Name|Latitude|Longitude
-    cond = [table_KT_rentals_with_stations.Parent_Id == table_stations_in_municipals.Parent]
-    table_ST_rental_with_stations = table_KT_rentals_with_stations\
-        .join(table_stations_in_municipals, cond, "left")\
-        .select(["scoutId","DHID","Parent","Name","Latitude","Longitude"])
-    table_ST_rental_with_stations.show(5)
-    del table_KT_rentals_with_stations, table_stations_in_municipals
-
-    # PERSIST to parquet
-    table_name = "table_ST_rentals_with_stations"
-    output_location = os.path.join(output_path, f"{table_name}.parquet")
-    table_ST_rental_with_stations.write.mode('overwrite').parquet(output_location)
-    helper.logger.debug(f"Exported {table_name} as parquet")
-
-
-
-    #table_ST_rental_with_stations.orderBy("scoutId").show(5)
-    #print(f"Total rows in apartments with stations: {table_ST_rental_with_stations.count()}")
-
-    helper.logger.debug("Created data mart")
-
-
-def step1(spark, input_path):
+def add_zipcode_to_stations(spark, input_path, output_path):
     """
-    Add zipcode to station data, since station data only columns 'Latitude', 'Longitude', 'MunicipalityCode'.
+    Add zipcode to station data using 'MunicipalityCode' and name the first three numbers of
+    zipcode as 'ZIP_Group_Station'.
 
     :param spark:                       Apache Spark session.
     :param input_path:                  Path for Input data.
-    :return table_stations_with_zip:    Station data having matched zip code.
+    :param output_path:                 Path for Output data.
     """
 
     # LOAD preprocessed STATION data
-    name = "table_majorstations_in_municipals"
+    # old: name = "table_majorstations_in_municipals"
+    name = "table_stations"
     table_stations_in_municipals = helper.create_df_from_parquet(spark, name, input_path)
 
     # LOAD preprocessed MAPPING data (municipality to zip code)
     name = "table_mapping_municipal_to_zip"
-    table_mapping_municipal_ZIP = helper.create_df_from_parquet(spark, name, input_path)
+    table_mapping_municipal_ZIP = helper.create_df_from_parquet(spark, name, input_path) \
+        .withColumnRenamed("name", "name_ZIP")\
+        .withColumnRenamed("MunicipalityCode", "MunicipalityCode_ZIP")
 
-    # JOIN data of Station and Mapping on municipality code
-    cond = [table_stations_in_municipals.MunicipalityCode == table_mapping_municipal_ZIP.AGS]
-    table_stations_with_zip = table_stations_in_municipals.join(table_mapping_municipal_ZIP, cond, "left")
-
-    # See: analyze.show_missing_munitipality_code(table_stations_with_zip)
-
-    return table_stations_with_zip
-
-
-def step2(spark, input_path, output_path, table_stations_with_zip):
-    """
-    Get Key Table holding joined data of Rental and Station based in some zip code.
-
-    :param spark:                       Apache Spark session.
-    :param input_path:                  Path for Input data.
-    :param output_path:                 Path for Output data.
-    :param table_stations_with_zip:     Rental data having a Station as result of step1.
-    :return KT_rental_with_station:     Key Table of Rental matched with Station data represents the IDs of both tables.
-    """
-
-    # GET Key Tables that just hold relevant keys (KT = Key Table)
-    required_columns = ["PLZ", "Parent"]
-    assert set(required_columns).issubset(table_stations_with_zip.columns), f"Missing columns {required_columns} not in table"
-    KT_stations_with_zip = table_stations_with_zip.select(required_columns).withColumnRenamed("Parent", "Parent_Id")
-
-    name = "table_rental_location"
-    required_columns = ["scoutId", "geo_plz"]
-    table_rental_location = helper.create_df_from_parquet(spark, name, input_path)
-    KT_rental_location = table_rental_location.select(required_columns)
-
-    # JOIN Rental and Station tables on 'PLZ' (== zip code)
-    cond = [KT_rental_location.geo_plz == KT_stations_with_zip.PLZ]
-    KT_rental_with_station = KT_rental_location\
-        .join(KT_stations_with_zip, cond, "left")
-
-    # EXTRACT Rental WITHOUT a matching Station / zip code. Just save the 'scoutID'
-    table_rental_missing_station_and_zip = KT_rental_with_station \
-        .where(KT_rental_with_station.PLZ.isNull())\
-        .select("scoutId")
-    table_name = "table_rental_missing_station_and_zip"
-    columns = table_rental_missing_station_and_zip.columns
-    helper.extract_to_table(base_table=table_rental_missing_station_and_zip, columns=columns,
-                            table_name=table_name, output_path=output_path, show_example=False,
+    # JOIN data of Station and Mapping (on municipality code)
+    cond = [table_stations_in_municipals.MunicipalityCode == table_mapping_municipal_ZIP.MunicipalityCode_ZIP]
+    table_stations_with_zip = table_stations_in_municipals\
+        .join(table_mapping_municipal_ZIP, cond, "left")
+    columns = table_stations_with_zip.columns
+    helper.extract_to_table(base_table=table_stations_with_zip, columns=columns,
+                            table_name="table_stations_with_zip", output_path=output_path,
                             single_partition=True)
 
-    # EXTRACT Rental with Station WITH a matching Station / zip code. Save the keys of this matching.
-    KT_rental_with_station = KT_rental_with_station\
-        .where(KT_rental_with_station.PLZ.isNotNull())\
-        .select(["scoutId", "geo_plz", "PLZ", "Parent_Id"])
-    table_name = "KT_rental_with_station"
-    columns = KT_rental_with_station.columns
-    helper.extract_to_table(base_table=KT_rental_with_station, columns=columns,
-                            table_name=table_name, output_path=output_path, show_example=False,
+    # AUSWERTUNG:
+    # table_stations_with_zip2.where(F.col("PLZ").isNull()).count() Out[210]: 110141
+    # table_stations_with_zip2.count() Out[211]: 511898
+    # -> ca 1/5 hat keine PLZ
+    # table_stations_with_zip2 = _join_parent_and_child(table_stations_with_zip)
+
+
+    #GET stations without a zipcode -> collect in df
+    file_name = "table_stations_with_zip"
+    table_stations_with_zip = helper.create_df_from_parquet(spark, file_name, input_path)
+    table_stations_with_zip = table_stations_with_zip.replace('', None)
+    df = table_stations_with_zip.where(F.col("PLZ").isNull()).select("SeqNo", "Latitude", "Longitude")
+
+    # SETUP Photon: Reverse geocode a coordinate
+    assert helper.check_photon_service(), f"No response from Photon"
+    url = "http://localhost:2322/reverse"
+    UDF_geocode = F.udf(helper.geocode_zipcodes, T.StringType())
+    file_name = "temp_filled_zipcodes.parquet"
+    data_location = os.path.join(output_path, file_name)
+
+    # QUERY zipcodes - first run
+    df = df.withColumn('Q_PLZ', UDF_geocode(F.col("Latitude"), F.col("Longitude")))  # duration: half hour
+    df = df.repartition(1)
+    df.write.mode("overwrite").parquet(data_location)
+
+    # QUERY zipcodes - rerun the query for remaining unknown zipcodes, because of some invalid connection
+    # (Some Socket numbers are not unique)
+
+    del df
+    df = helper.create_df_from_parquet(spark, file_name, input_path=input_path).replace('', None, 'Q_PLZ')
+    df = df.where(F.col("Q_PLZ").isNull())
+    df = df.withColumn('Q_PLZ', UDF_geocode(F.col("Latitude"), F.col("Longitude"))) \
+        .drop_duplicates().repartition(1)
+    file_name = "temp_filled_zipcodes2.parquet"
+    data_location = os.path.join(output_path, file_name)
+    df.write.mode("append").parquet(data_location)
+
+    del df
+    df = helper.create_df_from_parquet(spark, file_name, input_path=input_path).replace('', None, 'Q_PLZ')
+    df = df.where(F.col("Q_PLZ").isNull())
+    df = df.withColumn('Q_PLZ', UDF_geocode(F.col("Latitude"), F.col("Longitude"))) \
+        .drop_duplicates().repartition(1)
+    file_name = "temp_filled_zipcodes3.parquet"
+    data_location = os.path.join(output_path, file_name)
+    df.write.mode("append").parquet(data_location)
+
+    del df
+    df = helper.create_df_from_parquet(spark, file_name, input_path=input_path).replace('', None, 'Q_PLZ')
+    df = df.where(F.col("Q_PLZ").isNull())
+    df = df.withColumn('Q_PLZ', UDF_geocode(F.col("Latitude"), F.col("Longitude"))) \
+        .drop_duplicates().repartition(1)
+    file_name = "temp_filled_zipcodes4.parquet"
+    data_location = os.path.join(output_path, file_name)
+    df.write.mode("append").parquet(data_location)
+
+    del df
+    file_name = "temp_filled_zipcodes4.parquet"
+    df4 = helper.create_df_from_parquet(spark, file_name, input_path=input_path).where(F.col("Q_PLZ").isNotNull())
+    file_name = "temp_filled_zipcodes3.parquet"
+    df3 = helper.create_df_from_parquet(spark, file_name, input_path=input_path).where(F.col("Q_PLZ").isNotNull())
+    file_name = "temp_filled_zipcodes2.parquet"
+    df2 = helper.create_df_from_parquet(spark, file_name, input_path=input_path).where(F.col("Q_PLZ").isNotNull())
+    file_name = "temp_filled_zipcodes.parquet"
+    df = helper.create_df_from_parquet(spark, file_name, input_path=input_path).where(F.col("Q_PLZ").isNotNull())
+    df = df.union(df2).union(df3).union(df4).drop_duplicates()
+    df.show()
+    df.where(F.col("Q_PLZ").isNull()).count()
+
+    # COUNT of rows with and without a zipcode -> ACTUAL counts vary depending on your photon results!
+    df.show(1)
+    df.count()                              # count of all rows: Out[56]: 151090
+    df.where(F.col("Q_PLZ").isNotNull()).count()  # count of rows with a zipcode: Out[29]: 103453
+    df.where(F.col("Q_PLZ") != "").count()  # count of rows with a zipcode: Out[29]: 103453
+    df.where(F.col("Q_PLZ").isNull()).count()  # count of rows without a zipcode: Out[30]: 47637
+    df.where(F.col("Q_PLZ") == "").count()  # count of rows without a zipcode: Out[30]: 47637
+
+    # COMBINE source and derivate -> add column Q_PLZ to source
+    table_stations_with_zip3 = table_stations_with_zip.join(df.drop("Latitude", "Longitude"), ["SeqNo"], "left")
+    table_stations_with_zip3.count()
+    table_stations_with_zip3.show()
+
+    table_stations_with_zip3.where(F.col("PLZ").isNull()).count()  # >>>    Out[65]: 110141
+    table_stations_with_zip3.where(F.col("Q_PLZ").isNull()).count()   # >>>    Out[68]: 58
+
+    # DROP empty column PLZ, and rename column Q_plz to PLZ
+    UDF_combine = F.udf(helper.combine, T.StringType())
+    table_stations_with_zip4 = table_stations_with_zip3 \
+        .withColumn('C_PLZ', UDF_combine(F.col("PLZ"), F.col("Q_PLZ"))) \
+        .drop("PLZ", "Q_PLZ") \
+        .withColumnRenamed("C_PLZ", "PLZ") \
+        .withColumn('ZIP_Group_Station', F.col('PLZ').substr(1, 3))
+
+    # SHOW some stats
+    table_stations_with_zip4.show()
+    table_stations_with_zip4.count()
+    table_stations_with_zip4.where(F.col("PLZ").isNull()).count()
+    table_stations_with_zip4.where(F.col("PLZ").isNotNull()).count()
+    table_stations_with_zip4.where(F.col("PLZ").isNotNull()).show()
+
+    columns = table_stations_with_zip4.columns
+    helper.extract_to_table(base_table=table_stations_with_zip4, columns=columns,
+                            table_name="table_stations_with_zip_final", output_path=output_path,
                             single_partition=True)
 
-    return KT_rental_with_station
-
-
-def step3(spark, input_path, output_path, KT_rental_with_station):
-    """
-    Combine data of Rental location with matched Station.
-    Resulting table schema:
-    ['scoutId', 'date', 'regio1', 'regio2', 'regio3', 'street', 'streetPlain', 'houseNumber', 'PLZ', 'Parent_Id']
-
-    :param spark:                       Apache Spark session.
-    :param input_path:                  Path for Input data.
-    :param output_path:                 Path for Output data.
-    :param table_stations_with_zip:     Rental data having a Station as result of step1.
-    :return KT_rental_with_station:     Key Table of Rental matched with Station data represents the IDs of both tables.
-    """
-
-    # required: KT_rental_with_station, table_stations_in_municipals
-    required_columns = ["PLZ", "Parent_Id", "scoutId"]
-    assert set(required_columns).issubset(KT_rental_with_station.columns), f"Missing columns {required_columns} not in table"
-    KT_rental_with_station = KT_rental_with_station.withColumnRenamed("scoutId", "scoutId_2")
-
-    name = "table_rental_location"
-    table_rental_location = helper.create_df_from_parquet(spark, name, input_path)
-
-    cond = [table_rental_location.scoutId == KT_rental_with_station.scoutId_2]
-    table_rental_location_with_station = table_rental_location \
-        .join(KT_rental_with_station, cond, "right") \
-        .drop(*["geo_bln","geo_krs","geo_plz","scoutId_2"])
-        #.select(["scoutId", "DHID", "Parent", "Name", "Latitude", "Longitude"])
-    table_rental_location_with_station.show(5)
-
-    # PERSIST to parquet
-    table_name = "table_rental_location_with_station"
-    columns = table_rental_location_with_station.columns
-    helper.extract_to_table(base_table=table_rental_location_with_station, columns=columns,
-                            table_name=table_name, output_path=output_path, show_example=False)
+    # CLEAN data and extract stations with a zip code -> function clean_queried_stations
+    # Appending data leads to pairs of rows having identical SeqNo. Those pairs have rows without a zipcode AND
+    # rows with a zipcode. From those pairs, reduce rows without zipcode and keep those with a zip code!
 
     return
+
+
+"""
+def _query_zipcodes(spark, url, table_stations_with_zip, output_path, idx=None):
+    """"""
+    Process the files containing data for mappings (municipality code to zip code, and zip code to coordinates)
+    in the given path, derive tables and write these tables as parquet.
+
+    :param spark:                   Apache Spark session.
+    :param url:                     URL of Photon geocoding service.
+    :param table_stations_with_zip    Tables with rental offers and addresses.
+    :param output_path:             Path for Output data.
+    """"""
+
+    # SETUP for geocoding
+    schema = T.StructType([
+        T.StructField("Lat", T.DoubleType(), False),
+        T.StructField("Lng", T.DoubleType(), False)])
+    UDF_geocode = F.udf(helper.geocode_zipcodes, schema)
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
+
+    # SPLIT, maybe parallelize -> query separate photon instances
+    if not idx:
+        idx = table_stations_with_zip.approxQuantile("_id", [0.5], 0.00001)[0]
+
+    start_time = time.time()
+    df_temp = table_stations_with_zip.where(F.col("_id") <= idx)
+    df = df_temp.withColumn('extractedCoords',
+                            UDF_geocode(F.col("address_string"), F.lit(url)))  # last around one hour for first half
+
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
+    df = df.withColumn("lat", F.col("extractedCoords.Lat")) \
+        .withColumn("lng", F.col("extractedCoords.Lng")) \
+        .drop(F.col("extractedCoords"))
+    helper.extract_to_table(base_table=df, output_path=output_path, single_partition=True,
+                            table_name="table_rental_location_partA", columns=df.columns)
+    end_time = time.time()
+    helper.logger.info(f"Duration Querying PartA: {end_time - start_time}")
+
+    start_time = time.time()
+    df_temp = table_rental_location.where(F.col("_id") > idx)
+    df = df_temp.withColumn('extractedCoords',
+                            UDF_geocode(F.col("address_string"), F.lit(url)))  # last around one hour for second half
+
+    # See: https://www.mikulskibartosz.name/derive-multiple-columns-from-single-column-in-pyspark/
+    # See: https://sparkbyexamples.com/spark/spark-add-new-column-to-dataframe/
+    df = df.withColumn("lat", F.col("extractedCoords.Lat")) \
+        .withColumn("lng", F.col("extractedCoords.Lng")) \
+        .drop(F.col("extractedCoords"))
+    helper.extract_to_table(base_table=df, output_path=output_path, single_partition=True,
+                            table_name="table_rental_location_partB", columns=df.columns)
+    end_time = time.time()
+    helper.logger.info(f"Duration Querying PartB: {end_time - start_time}")
+
+    return
+"""
+
+
+def group_stations_by_zipcode(spark, input_path, output_path):
+    """
+    Group/partition stations by first three numbers of the zip codes.
+
+    :param spark:                       Apache Spark session.
+    :param input_path:                  Path for Input data.
+    :param output_path:                 Path for Output data.
+    """
+
+    # GET table stations, that holds shorted zipcode and relevant facts
+    name = "table_stations_with_zip_final"
+    table_stations_with_zip = helper.create_df_from_parquet(spark, name, input_path)
+
+    # GET table rentals, that holds zip code
+    name = "table_rental_location"
+    required_columns = ["geo_plz"]  # drop scoutId and just handle all distinct zip_code groups
+    table_rental_location = helper.create_df_from_parquet(spark, name, input_path) \
+        .select(required_columns) \
+        .withColumn('ZIP_Group_Rental', F.col('geo_plz').substr(1, 3)) \
+        .drop("geo_plz") \
+        .distinct()
+    table_rental_location.show()
+
+    # Statistic: Check total counts of zip group:
+    # table_rental_location.select("ZIP_Group_Rental").distinct().count() >>> Out[94]: 733
+    # table_stations_grouped.select("ZIP_Group_Station").distinct().count() >>> Out[95]: 547
+
+    # JOIN Rental and Station tables on zip-group
+    # left join keeps the zip group of the rentals and adds all stations with matching zip group
+    cond = [table_rental_location.ZIP_Group_Rental == table_stations_with_zip.ZIP_Group_Station]
+    table_stations_grouped = table_rental_location \
+        .join(table_stations_with_zip, cond, "left") \
+        .repartition(1) \
+        .cache()
+
+
+    # PERSIST to parquet
+    table_name = "table_stations_grouped"
+    columns = table_stations_grouped.columns
+    helper.extract_to_table(base_table=table_stations_grouped, columns=columns,
+                            single_partition=True, table_name=table_name, output_path=output_path,
+                            show_example=False)
+
+    return
+
+
+def query_nearest_stations(spark,
+                           input_path,
+                           scoutId=None,
+                           table_rental_location_coords=None,
+                           table_stations_grouped=None):
+    """
+    Query stations next to given rental location providing scoutId.
+
+    :param spark:                           Apache Spark session.
+    :param input_path:                      Path for Input data.
+    :param scoutId:                         scoutId of offered rental.
+    :param table_rental_location_coords:    Spark dataframe of rental offers with coordinates.
+    """
+
+    """
+    Strategie:
+    je scoutId mit Werten lat und lng aus der table_rental_location_coords:
+    - gehe in table_KT_rental_with_station und filtere darin auf jeweilige scoutId -> erstelle gruppe je scoutId
+    - bestimme nächste Nachbarn von (lat, lng):
+        - erstelle / schätze kd baum für gruppe in table_KT_rental_with_station
+        - durchsuche kd baum für (lat, lng) -> es werden entsprechend anzahl kleinster nachbarn mehrere indizes ausgegeben
+        - für jeweiligen index in gruppe ermittle Parent_Id Latitude Longitude Name
+    """
+
+    # TODO: partitioniere table_rental_location_coords und table_KT_rental_with_station nach zip_group
+    # TODO: exkludiere zip_group mit (PLZ gleich null) in table_KT_rental_with_station
+
+    # LOAD table_stations_grouped
+    if not table_stations_grouped:
+        table_name = "table_stations_grouped"
+        helper.logger.info("Loading table_stations_grouped...")
+        table_stations_grouped = helper.create_df_from_parquet(spark, table_name, input_path)
+    assert table_stations_grouped, f"Dataframe table_stations_grouped is NOT loaded."
+
+    # LOAD table table_rental_location_coords
+    if not table_rental_location_coords:
+        helper.logger.info("Loading table_rental_location_coords...")
+        table_rental_location_coords = load_table_rental_locations_with_coordindates(spark, input_path)
+    assert table_rental_location_coords, f"Dataframe table_rental_location_coords is NOT loaded."
+
+    if not scoutId:
+        scoutId = 115209583  # rental offer in Leipzig, Nordstr.
+        helper.logger.info("Found no valid scoutId. Using example scoutId={scoutId}".format(scoutId))
+
+    # GET single rental coordinates via scoutId
+    row = table_rental_location_coords.where(F.col("scoutId").isin(scoutId)).collect()
+    assert len(row) == 1, f"Cant find single valid scoutId {scoutId} in rental offers (table_rental_location_coords)"
+    row = row[0]
+    helper.logger.info(f"Found valid scoutId {scoutId}. Querying nearest stations...")
+
+    # PREPARE for kd tree
+    df_stations_for_zip_groups = table_stations_grouped \
+        .where(( F.col("ZIP_Group_Rental") == row["zip_group"]))\
+        .select(*["Latitude", "Longitude", "Parent",
+                  "DHID", "Name"]) \
+        .dropDuplicates() \
+        .toPandas()\
+        .dropna()
+
+    if (df_stations_for_zip_groups["Latitude"].count() >0) \
+            & (df_stations_for_zip_groups["Longitude"].count()>0):
+        stations_in_zipgroups = df_stations_for_zip_groups.loc[:, ["Latitude", "Longitude"]].values.tolist()
+
+        # QUERY kd tree to find nearest neighbours
+        # See https://kanoki.org/2020/08/05/find-nearest-neighbor-using-kd-tree/
+        tree = spatial.KDTree(stations_in_zipgroups)
+        start_location = (row["lng"], row["lat"], row["address_string"])
+        idxs = tree.query((row["lng"], row["lat"]), 10)
+        print(f"\nRental location:\n{start_location}\n")
+        print(f"Nearest Stations:\n")
+        nearest_stations = df_stations_for_zip_groups.iloc[idxs[1], :]
+        nearest_stations = nearest_stations.dropna()
+        print(f"{nearest_stations}\n")
+
+        # TODO: check nearest_stations
+        if nearest_stations.empty:
+            helper.logger.debug("Invalid nearest_stations")
+            # Ist DF korrekt für weiterverarbeitung?
+            # nearest_stations = df.columns = ['Latitude', 'Longitude', 'Parent', 'DHID', 'Name']
+
+    return (row, nearest_stations)
+
+
+def show_nearest_station(spark, output_path, scoutId, scout_apartment_infos, nearest_stations):
+
+    """
+    scout_apartment_infos, nearest_stations = query_nearest_stations(
+        spark,
+        input_path=output_path,
+        scoutId=scoutId,
+        table_rental_location_coords=table_rental_location_coords,
+        table_stations_grouped=table_stations_grouped)
+    """
+
+    m = folium.Map(location=[scout_apartment_infos["lng"], scout_apartment_infos["lat"]], zoom_start=15)
+    folium.CircleMarker(location=(scout_apartment_infos["lng"], scout_apartment_infos["lat"]),
+                        tooltip=scout_apartment_infos.address_string,
+                        color="red",
+                        fill=True
+                        ).add_to(m)
+
+    for station in nearest_stations.itertuples():
+        folium.CircleMarker(location=(station.Latitude, station.Longitude),
+                            popup=station.Name, tooltip=station.Name).add_to(m)
+        m.save("index.html")
+
+    # Show HTMl in Webbrowser via Python: https://stackoverflow.com/a/21437460
+    path = os.path.abspath('temp.html')
+    url = 'file://' + path
+
+    with open(path, 'w') as f:
+        f.write(m._repr_html_())
+    webbrowser.open(url)
+
+    return m, url

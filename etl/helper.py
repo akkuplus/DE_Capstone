@@ -6,15 +6,11 @@ from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
 import re
+import requests
 import sys
 
-
-
-
-data_location = os.getcwd()
-os.path.split(data_location)
+# INIT Logger
 data_location = 'event_and_error.log'
-
 # See https://gist.github.com/wassname/d17325f36c36fa663dd7de3c09a55e74
 formatter = logging.Formatter('[%(asctime)s] %(name)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s')
 file_handler = logging.FileHandler(filename=data_location)
@@ -25,7 +21,7 @@ stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setLevel(logging.INFO)
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='[{%(filename)s:%(lineno)d} %(levelname)s - %(message)s',
     handlers=[
         file_handler,
@@ -34,7 +30,7 @@ logging.basicConfig(
 )
 
 # Pyspark logger: see https://stackoverflow.com/questions/34248908/how-to-prevent-logging-of-pyspark-answer-received-and-command-to-send-messag
-logging.getLogger("py4j").setLevel(logging.DEBUG)
+logging.getLogger("py4j").setLevel(logging.INFO)
 logging.getLogger('pyspark').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.info("\nInitialized logger")
@@ -60,19 +56,15 @@ def get_setup(do_test_s3_access=False, default_spark_log_level="ERROR"):
     """
 
     spark = create_spark_session(do_test_s3_access=do_test_s3_access, default_spark_log_level=default_spark_log_level)
-    msg = f"Got Spark session"
-    logger.info(msg)
 
     # SET input and output path
     input_path = get_config_or_default("S3", "INPUT_PATH")
     assert input_path, "Input_Path is not set"
-    msg = f"Set input_data_path to {input_path}"
-    logger.info(msg)
+    logger.info(f"Set input_data_path to {input_path}")
 
     output_path = get_config_or_default("S3", "OUTPUT_PATH")
     assert input_path, "Output_Path is not set"
-    msg = f"Set output_data_path to {output_path}"
-    logger.info(msg)
+    logger.info(f"Set output_data_path to {output_path}")
 
     return spark, input_path, output_path
 
@@ -83,7 +75,6 @@ def create_spark_session(do_test_s3_access=False, default_spark_log_level="ERROR
 
     :return: SparkSession
     """
-
 
     # GET Spark Session
     # https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/2.7.0/hadoop-aws-2.7.0.jar
@@ -101,7 +92,6 @@ def create_spark_session(do_test_s3_access=False, default_spark_log_level="ERROR
         .getOrCreate()
 
     spark.sparkContext.setSystemProperty("com.amazonaws.services.s3.enableV4", "true")
-    #spark.sparkContext.setLogLevel(default_spark_log_level)
     logger.info("Initialized Spark instance")
 
     # GET S3 access settings
@@ -137,9 +127,25 @@ def create_spark_session(do_test_s3_access=False, default_spark_log_level="ERROR
     return spark
 
 
-def test_s3_access(spark):
+def check_photon_service(url="http://localhost:2322/api"):
+    # TEST connection to Photon:
+    logger.info(f"Querying Photon geocode service...")
+    try:
+        querystring = {"q": "Brandenburger Tor, Pariser Platz, 10117 Berlin", "lang": "de", "limit": "1"}
+        response = requests.request("GET", url, params=querystring)
+        assert '"osm_id":518071791' in response.text, f"Can't find expected OSM ID for {url}"
+        coords = geocode_coordinates(querystring['q'], url=url)
+        logger.info(f"Successfully queried Photon geocode service. Brandenburger Tor in Berlin is at {coords}.")
+    except requests.exceptions as ex:
+        logger.error(f"Error testing Photon geocoding service. Reason: {ex}")
+        return False
+
+    return True
+
+
+def test_s3_access(spark, OUTPUT_PATH=None):
     """
-    Test provide configuration and test write access to S3a using a Spark session.
+    Test write and read access to S3a using a Spark session.
 
     :param spark: SparkSession
     """
@@ -147,6 +153,7 @@ def test_s3_access(spark):
     # TEST read-write access
     try:
         OUTPUT_PATH = get_config_or_default('S3', 'OUTPUT_PATH')
+        assert s3_object_exists, f"Object {OUTPUT_PATH} does not exists."
 
         data, columns = [(1, 1)], ["col1", "col2"]
         data_location = f"{OUTPUT_PATH}/test.parquet"
@@ -282,18 +289,25 @@ def get_schemas(name: str):
 
 def s3_object_exists(input_location):
 
-    # GET S3 access settings
-    ACCESS_ID = get_config_or_default('S3', 'AWS_ACCESS_KEY_ID')
-    ACCESS_SECRET = get_config_or_default('S3', 'AWS_SECRET_ACCESS_KEY')
-    OUTPUT_PATH = get_config_or_default('S3', 'OUTPUT_PATH')
+    if input_location[:2].upper() == "S3":
 
-    assert bool(ACCESS_ID) \
-           and bool(ACCESS_SECRET) \
-           and bool(OUTPUT_PATH), \
-        f"Error reading AWS S3a access keys. A key is missing."
+        logger.debug(f"Checking Existence of S3 object...")
+        # GET S3 access settings
+        ACCESS_ID = get_config_or_default('S3', 'AWS_ACCESS_KEY_ID')
+        ACCESS_SECRET = get_config_or_default('S3', 'AWS_SECRET_ACCESS_KEY')
+        OUTPUT_PATH = get_config_or_default('S3', 'OUTPUT_PATH')
 
-    s3_fs = s3fs.S3FileSystem(key=ACCESS_ID, secret=ACCESS_SECRET)
-    return True if s3_fs.exists(input_location) else False
+        assert bool(ACCESS_ID) \
+               and bool(ACCESS_SECRET) \
+               and bool(OUTPUT_PATH), \
+            f"Error reading AWS S3a access keys. A key is missing."
+
+        s3_fs = s3fs.S3FileSystem(key=ACCESS_ID, secret=ACCESS_SECRET)
+        return True if s3_fs.exists(input_location) else False
+
+    if input_location[:2].upper() != "S3":
+        logger.debug(f"Checking Existence of local object..")
+        return True if os.path.exists(input_location) else False
 
 
 def get_s3_object(input_location):
@@ -313,7 +327,14 @@ def get_s3_object(input_location):
     return s3_fs.open(input_location)
 
 
-def extract_to_table(base_table, columns, table_name, output_path, show_example=False, single_partition=False):
+def extract_to_table(base_table,
+                     columns,
+                     table_name,
+                     output_path,
+                     show_example=False,
+                     single_partition=False,
+                     partition_name=None
+                     ):
     """
     Extract from a base table a given set of columns to parquet.
 
@@ -341,15 +362,19 @@ def extract_to_table(base_table, columns, table_name, output_path, show_example=
         # PERSIST to parquet
         output_location = os.path.join(output_path, f"{table_name}.parquet")
 
-        if single_partition:
+        if single_partition and not partition_name:
             # See https://mungingdata.com/apache-spark/output-one-file-csv-parquet/ or
             # https://kontext.tech/column/spark/296/data-partitioning-in-spark-pyspark-in-depth-walkthrough
             logger.info(f"Repartitioning dataframe that has {base_table.rdd.getNumPartitions()} partition(s)")
             base_table = base_table.repartition(1)
             logger.info(f"Successfully repartitioned dataframe to {base_table.rdd.getNumPartitions()} partition")
+            logger.info(f"Writing {table_name} to {output_location} ...")
+            base_table.write.mode('overwrite').parquet(output_location)
 
-        logger.info(f"Writing {table_name} to {output_location} ...")
-        base_table.write.mode('overwrite').parquet(output_location)
+        if (partition_name) and (partition_name in base_table.columns):
+            logger.info(f"Repartitioned dataframe by {partition_name} as partition")
+            logger.info(f"Writing {table_name} to {output_location} ...")
+            base_table.write.mode('overwrite').partitionBy(partition_name).parquet(output_location)
 
         assert s3_object_exists(output_location), f"Error writing. Object does not exists ({output_location})"
         logger.info(f"Successfully wrote {table_name} to {output_location}")
@@ -385,9 +410,53 @@ def create_df_from_parquet(spark, name, input_path):
         """
 
         df = spark.read.parquet(data_location)
+        logger.info(f"Successfully imported {name} to Spark dataframe. Sourced object imported.")
     except Exception as ex:
         logger.error(f"Error creating dataframe {name}. Reason: {ex}")
         df = None
-    logger.info(f"Successfully imported {name} to Spark dataframe")
 
     return df
+
+
+def geocode_coordinates(address_string, url):
+    try:
+        logger.debug(f"Querying {address_string}")
+        # querystring = {"q": "Brandenburger Tor, Pariser Platz, 10117 Berlin", "lang": "de", "limit": "1"}
+        querystring = {"q": address_string, "lang": "de", "limit": "1"}
+        response = requests.request("GET", url, params=querystring)
+        if len(response.json()["features"]) > 0:
+            coords = response.json()["features"][0]["geometry"]["coordinates"]
+        else:
+            coords = (float('nan'), float('nan'))
+        logger.info(f"Queried {address_string}.")
+    except Exception as ex:
+        logger.error(f"Error querying {address_string}. Reason: {ex}. Response: {response}")
+        coords = float('nan'), float('nan')
+
+    return coords[0], coords[1]
+
+
+def geocode_zipcodes(lat, lon, url="http://localhost:2322/reverse"):
+    try:
+        logger.debug(f"Querying {lat}, {lon} ...")
+        querystring = {"lat": lat, "lon": lon}  # /reverse?lon=10&lat=52
+        queryurl = f"{url}?lon={lon}&lat={lat}"
+        response = requests.request("GET", url, params=querystring)
+        if len(response.json()["features"]) > 0:
+            zipcode = response.json()["features"][0]["properties"]["postcode"]
+        else:
+            zipcode = None
+
+        logger.info(f"Queried {lat}, {lon}")
+    except Exception as ex:
+        logger.error(f"Error querying {queryurl}. Reason: {ex}.")
+        zipcode = ""
+
+    return zipcode
+
+
+def combine(col1, col2):
+    if col1 is not None:
+        return col1
+    else:
+        return col2
