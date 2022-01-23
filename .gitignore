@@ -1,0 +1,16 @@
+/.idea
+/.old
+/data
+/misc
+/photon
+/SparkTemp
+/venv
+/venv2
+
+dl.cfg
+emr_bootstrap.sh
+event_and_error.log
+index.html
+temp.html
+requirements.txt
+etl/Snippets.py
