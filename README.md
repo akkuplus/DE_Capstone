@@ -9,7 +9,6 @@ To this purpose, the project provides routines to move data to AWS S3, conducts 
 
 Therefore, we integrate various data sources, like apartment rental data (from Kaggle), data of stations within the German public transportation system (from DELFI e.V.), data of a german municipal directory (from Statistisches Bundesamt) with a related mapping (municipality code to zip codes), and the locally deploy 'Photon' geocoding service.
 
-Later versions of this project will integrate data regarding stations of the German Railway, data of nearby highways and motorways. Further, integration of major apartment rental platforms (via their API) and transportation schedules is desired.
 
 Section Data describes the raw data and the data model. The Setup section leads through all configurations, 
 and with section "ETL Operations" you will start the project.
@@ -439,8 +438,36 @@ The GitHub projects provides the template file `dl_example.cfg`.
 Rename the file to `dl.cfg` set the four parameters! 
 
 
-## Start ELT
+## Run and use Pipeline
+
+### Start the Pipeline
 
 
+If updates of the apartment data or the public transportation station occur, rerun the data pipeline. 
+
+Regular update could take place using Apache Airflow. A corresponding Apache Airflow dag contains the upload of 
+dataset to S3 and the execution of the data pipeline.    
 
 ## Utilize data model
+
+### query nearest stations
+
+### find an appropriate apartment and retrieve the scoutID
+
+## Future Considerations
+
+Later versions of this project can integrate various data sources. Stations of the German Railway and even data
+of nearby highways and motorways are desired. Integration of an apartment rental platform via their API makes 
+the data integration more flexible. Essentially, the stations need to be structured in groups of zip codes and 
+location information from apartments needs to point to such a group of zip codes.
+
+From a technological point of view, if Apache Spark with standalone server mode can not completely process the 
+data set, we can distribute data in an AWS EMR cluster for processing large data sets. If 100+ people query 
+neighbored stations of different apartments in parallel, we can scale over separate cluster workers.
+
+The underlying querying step finds the corresponding group of zip codes and calculates the smallest distances of 
+stations via the k-nearest tree. We can distribute all groups of stations to each worker. Alternatively, we can 
+separate groups of stations via partition key using S3 and Parquet.
+
+Apache Airflow is a perfect fit to automatically update the data via the data pipeline and to report data 
+quality issues.
