@@ -1,0 +1,270 @@
+https://www.perfectlyrandom.org/2018/08/11/setup-spark-cluster-on-aws-emr/
+
+Create VPC with public Subnet
+https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Scenario1.html
+
+***Create Cluster - Advanced Options***
+
+**Step 1: Software and Steps**
+
+
+*Software Configuration*
+Select Release: emr-6.5.0
+Select Hadoop and Spark
+
+Click "NEXT"
+
+
+**Step 2: Hardware**
+
+*Networking*
+Network: <select your VPC>
+
+EC2 Subnet: will be set according to previously set Network / subnet, verify!
+
+*Cluster Nodes and Instances*
+Set 	Master:	m4.2xlarge (32 GB, 8 Cores) and set just 1 Instance and select "Spot" (The Script saves all intermediate results to S3)
+
+Delete Core or Worker: these are not required for the ETL!
+
+*EBS Root Volume*
+Set "Root device EBS volume size" to 60 GiB 
+
+Click "NEXT"
+
+
+**Step 3: General Cluster Settings**
+
+*General options*
+Set a Cluster name
+Set logging and choose -> your S3 path
+Deselect "Termination protection"
+
+
+*Additional Options*
+On "Bootstrap Actions" set "Add bootstrap action" to -> "Custom action" -> "Configure and add" and set "Script location" to s3://f3de543c84/Capstone_Project/emr_bootstrap.sh -> "Add"
+
+Click "NEXT"
+
+
+**Step 4: Security**
+
+*Security Options*
+In "EC2 key pair" select your IAM key pair
+
+
+*Permissions*
+
+Open "EMR role": click "EMR_DefaultRole" -> in thr section IAM "Permissions policies" click  "permissions" -> "Attach policies" filter policies to "AmazonS3FullAccess"  and add it. Further verify the policies "AmazonElasticMapReduceRole" and "AdministratorAccess"
+
+Open "EC2 instance profile": click "EMR_EC2_DefaultRole" -> in IAM "Permissions policies"  add policy "AmazonS3FullAccess" and verfify "AmazonElasticMapReduceRole" and "AdministratorAccess" policies.
+
+"EC2 security groups"
+Master: ElasticMapReduceMaster (public SSH is required!)
+Core & Task is not relevant!
+
+Click *Create cluster*
+
+
+A new pages opens and shows the cluster information.
+
+Select the "Summary" tab
+
+In section "Application user interfaces" -> see "On-cluster user interfaces" -> click "Enable an SSH Connection":
+	If you are using Windows with Putty on local host, copy the Host Name in bold, e.g. hadoop@xx.xx.compute.amazonaws.com
+
+	If you are using Linux on local host, copy the ssh command, e.g. ssh -i ~/Capstone_EMR.pem -ND 8157 hadoop@xx.xx.compute.amazonaws.com
+
+Putty Setup:
+
+Start Putty
+Set "Host Name" to hadoop@xx.xx.compute.amazonaws.com
+Select "Connection" -> "SSH" -> "Auth" -> Field "Private key file for authentification"  Select "Browse" -> Select your Private Key file
+Select "Connection" -> "SSH" -> "Tunnels" -> Set "Source port" to 8888 and set Destination to "localhost:8888" and Left rest as default
+Click "Open" and select "Accept" -> Login to EMR instance as hadoop@<EMR ip>
+
+
+
+
+		### Set Port Forwarding
+		https://sysnews.ma.ic.ac.uk/ssh/port-forwarding-for-Windows-using-PuTTY.html
+		- set ssh host and add ssh authentification -> pem.file
+
+		*config ssh tunnel*
+		https://tecadmin.net/putty-ssh-tunnel-and-port-forwarding/ --> Local Port Forwarding with PuTTY
+		- Putty change settings -> Connection -> SSH -> Tunnel: Source Port: 8888; Destination: localhost:8888 Local: X  and Auto: X
+
+
+
+
+Check cluster
+$ whoami
+-> must return 
+"
+hadoop
+"
+
+$ python -m site
+-> must return 
+"
+sys.path = [
+    '/home/hadoop',
+    '/usr/lib64/python37.zip',
+    '/usr/lib64/python3.7',
+    '/usr/lib64/python3.7/lib-dynload',
+    '/usr/local/lib64/python3.7/site-packages',
+    '/usr/local/lib/python3.7/site-packages',
+    '/usr/lib64/python3.7/site-packages',
+    '/usr/lib/python3.7/site-packages',
+]
+...
+"
+
+
+sudo chmod -R 777 /home/hadoop
+sudo chmod -R 777 /tmp
+
+
+$ which pyspark
+-> must return 
+"
+/usr/bin/pyspark
+"
+
+new file setup-environment.sh:
+
+	##########
+	# https://medium.com/tinghaochen/how-to-install-pyspark-locally-94501eefe421
+	# https://www.educative.io/edpresso/how-to-set-up-a-spark-environment
+
+	export SPARK_HOME=/usr/lib/spark
+	export PATH="$SPARK_HOME/bin:$PATH"
+	export PATH="/home/hadoop/.local/bin:$PATH"
+	export PYSPARK_PYTHON=/usr/lib/spark/python     
+
+
+
+	pip install --user py4j requests~=2.26.0 s3fs~=2021.10.1 pandas~=1.3.3 numpy~=1.21.2 scipy~=1.7.2 scikit-learn~=1.0.1 folium~=0.12.1.post1 plotly~=5.4.0 Flask~=2.0.2 jupyter ipython seaborn
+
+
+	export PYTHONPATH="/usr/lib/spark/python:/home/hadoop/.local/lib/python3.7/site-packages:$PYTHONPATH"
+	export PYSPARK_DRIVER_PYTHON="/home/hadoop/.local/bin/jupyter"
+	export PYSPARK_DRIVER_PYTHON_OPTS="notebook --no-browser"
+	##########
+
+$ sudo chmod 777 setup-environment.sh
+$ ./setup-environment.sh
+
+
+		### https://medium.com/tinghaochen/how-to-install-pyspark-locally-94501eefe421
+		### https://www.educative.io/edpresso/how-to-set-up-a-spark-environment
+		export SPARK_HOME=/usr/lib/spark
+		export PATH="$SPARK_HOME/bin:$PATH"
+		export PATH="/home/hadoop/.local/bin:$PATH"
+		export PYSPARK_PYTHON=/usr/lib/spark/python     
+		 --- pyspark ---
+
+
+$ $SPARK_HOME
+must return
+	"
+	-bash: /usr/lib/spark: Is a directory
+	"
+
+		pip install --user py4j requests~=2.26.0 s3fs~=2021.10.1 pandas~=1.3.3 numpy~=1.21.2 scipy~=1.7.2 scikit-learn~=1.0.1 folium~=0.12.1.post1 plotly~=5.4.0 Flask~=2.0.2 jupyter ipython seaborn
+
+
+$ sudo chmod -R 777 /home/hadoop/s3a
+$ nano launch-jupyter.sh
+
+new launch-jupyter.sh
+	##########
+	#! /usr/bin/env bash
+	echo $PYTHONPATH
+	echo $PYSPARK_DRIVER_PYTHON
+	echo $PYSPARK_DRIVER_PYTHON_OPTS
+
+	pyspark --conf spark.local.dir=/home/hadoop	
+	##########
+
+
+		#! /usr/bin/env bash
+		export PYTHONPATH="/usr/lib/spark/python:/home/hadoop/.local/lib/python3.7/site-packages:$PYTHONPATH"
+		#export PYTHONPATH="/home/hadoop/.local/lib/python3.7/site-packages:$PYTHONPATH"
+		#export PYTHONPATH="/usr/lib/spark/python:$PYTHONPATH"
+		export PYSPARK_DRIVER_PYTHON=/home/hadoop/.local/bin/jupyter
+		export PYSPARK_DRIVER_PYTHON_OPTS='notebook --no-browser'
+		echo $PYTHONPATH
+		echo $PYSPARK_DRIVER_PYTHON
+		echo $PYSPARK_DRIVER_PYTHON_OPTS
+		pyspark --conf spark.local.dir=/home/hadoop
+
+
+
+$ sudo chmod 777 launch-jupyter.sh
+$ ./launch-jupyter.sh
+
+the Jupyter server is starting. A Jupyter session URL like
+http://localhost:8888/?token=08392e8801ed1b4c355f2d5af272ceb24c8bf282e1875479
+appears. Copy and temorarily save it.
+
+
+Open Jupyter session URL in local browser ( the AWS instance has no browser aws :-) ) 
+http://localhost:8888/?token=08392e8801ed1b4c355f2d5af272ceb24c8bf282e1875479
+
+
+Jupyter should start. Withon Jupyter, upload your local file dl.cfg into Jupyter project root. Not the Project root should look like: 
+
+	/
+	/etl
+	...
+	/etl_script.ipynb
+	/dl.cfg
+	...
+
+
+**Current Error*
+- helper.test_s3_access(spark)
+- [{helper.py:160} INFO - Testing access to S3 location s3a://4cc43489cd/data_mart//test.parquet
+[{helper.py:172} ERROR - Error accessing S3 address s3a://4cc43489cd/data_mart//test.parquet. Reason An error occurred while calling o98.parquet.
+: org.apache.spark.SparkException: Job aborted.
+
+
+-> https://stackoverflow.com/questions/51092758/setting-spark-local-dir-in-pyspark-jupyter
+
+*Config for SparkContext*
+spark._jsc.hadoopConfiguration().set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+spark._jsc.hadoopConfiguration().set("com.amazonaws.services.s3.enableV4", "true")
+spark._jsc.hadoopConfiguration().set("hadoop.tmp.dir","home/hadoop,/tmp") 
+spark._jsc.hadoopConfiguration().set("fs.s3a.fast.upload.buffer","disk")
+spark._jsc.hadoopConfiguration().set("fs.s3a.buffer.dir","/home/hadoop/s3a,/tmp")
+spark._jsc.hadoopConfiguration().set("spark.hadoop.fs.s3a.buffer.dir","/home/hadoop,/tmp")
+
+
+
+		sudo mkdir /home/hadoop/s3a
+		sudo chmod -R 777 /home/hadoop/s3a
+		sudo chmod 777 -R /tmp
+
+
+setup-photon.sh
+	############
+	#! /usr/bin/env bash
+	
+	sudo mkdir -p /home/hadoop/photon
+	sudo chmod -R 777 /home/hadoop/photon
+	cd /home/hadoop/photon 
+	
+	sudo aws s3 cp s3://f3de543c84/Photon/ . --recursive
+	sudo cat *tar.* | tar -xvf - -i
+	sudo tar -xvf photon_data.tar
+	############
+
+$ sudo chmod 777 setup-photon.sh
+$ ./setup-photon.sh
+
+
+
+
+
+https://docs.aws.amazon.com/de_de/AWSEC2/latest/UserGuide/managing-users.html
