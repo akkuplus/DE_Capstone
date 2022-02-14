@@ -1,3 +1,4 @@
+/.ipynb_checkpoints
 /.idea
 /.old
 /data
@@ -8,7 +9,6 @@
 /venv2
 
 dl.cfg
-emr_bootstrap.sh
 event_and_error.log
 index.html
 temp.html
